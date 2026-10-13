@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# cca — pick a Claude Code account, then launch claude with its config dir.
+#
+#   cca                      pick an account interactively, then launch claude
+#   cca <name> [args...]     launch claude for <name>; args go to claude
+#   cca add <name>           create account and launch claude to /login
+#   cca ls                   list accounts with logged-in email
+#   cca rm <name>            delete account (asks first)
+#   cca rename <old> <new>   rename account (renaming "default" only sets its display name)
+#   cca --safe ...           same, but WITHOUT bypass-permissions mode
+#
+# Default: claude runs with --dangerously-skip-permissions. Opt out per run with
+# --safe (first argument) or always with CCA_SAFE=1.
+#
+# "default" is the normal ~/.claude. Other accounts live in ~/.claude-accounts/<name>
+# and symlink the SHARED items from ~/.claude, so only login state differs.
+# Optional <account>/env (KEY=value lines) is exported before launch.
+set -euo pipefail
+
+BASE="$HOME/.claude"
+ACC="$HOME/.claude-accounts"
+SHARED=(CLAUDE.md RTK.md settings.json keybindings.json skills plugins agents commands projects)
+RESERVED=(default add ls rm rename help)
+NAMEFILE="$ACC/.default-name"
+
+die() { echo "cca: $*" >&2; exit 1; }
+
+valid_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "invalid name '$1' (use a-z 0-9 _ -)"
+  local r; for r in "${RESERVED[@]}"; do [[ "$1" != "$r" ]] || die "'$1' is reserved"; done
+}
+
+default_name() { cat "$NAMEFILE" 2>/dev/null || echo default; }
+
+# Map a name to "default" if it is the default account's display name.
+resolve() { [[ "$1" == default || "$1" == "$(default_name)" ]] && echo default || echo "$1"; }
+
+# Fail if <name> is already used by any account (including default's display name).
+free_name() {
+  [[ ! -e "$ACC/$1" && "$1" != "$(default_name)" ]] || die "account '$1' already exists"
+}
+
+accounts() {
+  default_name
+  [[ -d "$ACC" ]] || return 0
+  local d; for d in "$ACC"/*; do [[ -d "$d" && ! -L "$d" ]] && basename "$d"; done
+}
+
+# Link shared items that exist in ~/.claude but are missing in the account dir.
+link_shared() {
+  local dir="$1" item
+  for item in "${SHARED[@]}"; do
+    [[ -e "$BASE/$item" && ! -e "$dir/$item" && ! -L "$dir/$item" ]] && ln -s "$BASE/$item" "$dir/$item"
+  done
+  return 0
+}
+
+email_of() {
+  local f
+  [[ "$(resolve "$1")" == default ]] && f="$HOME/.claude.json" || f="$ACC/$1/.claude.json"
+  [[ -f "$f" ]] || { echo "(not logged in)"; return; }
+  grep -o '"emailAddress"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" | head -1 | sed 's/.*"\([^"]*\)"$/\1/' | grep . || echo "(not logged in)"
+}
+
+launch() {
+  local name; name="$(resolve "$1")"; shift
+  # Bypass permissions unless opted out or the user chose a permission flag themselves.
+  # Decided before the account env file is sourced, so that file cannot change it.
+  local a flags=(--dangerously-skip-permissions)
+  [[ "$SAFE" == 1 ]] && flags=()
+  for a in "$@"; do
+    case "$a" in
+      --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions) flags=() ;;
+    esac
+  done
+  readonly flags
+  if [[ "$name" == default ]]; then
+    unset CLAUDE_CONFIG_DIR
+  else
+    valid_name "$name"
+    local dir="$ACC/$name"
+    [[ -d "$dir" ]] || die "no account '$name' (see: cca ls)"
+    link_shared "$dir"
+    export CLAUDE_CONFIG_DIR="$dir"
+    if [[ -f "$dir/env" ]]; then set -a; . "$dir/env"; set +a; fi
+  fi
+  exec claude "${flags[@]}" "$@"
+}
+
+pick() {
+  local list; list="$(accounts)"
+  if command -v fzf >/dev/null && [[ -t 0 ]]; then
+    fzf --prompt='account> ' --height=~40% --reverse <<<"$list" || exit 1
+  else
+    local choice PS3='account #: '
+    select choice in $list; do [[ -n "$choice" ]] && { echo "$choice"; return; }; done
+    exit 1
+  fi
+}
+
+SAFE=0
+[[ "${CCA_SAFE:-}" == 1 ]] && SAFE=1
+if [[ "${1:-}" == --safe ]]; then SAFE=1; shift; fi
+readonly SAFE
+
+cmd="${1:-}"
+case "$cmd" in
+  "") name="$(pick)" || exit 1; launch "$name" ;;
+  add)
+    name="${2:-}"; [[ -n "$name" ]] || die "usage: cca add <name>"
+    valid_name "$name"; free_name "$name"
+    mkdir -p -m 700 "$ACC"; mkdir -m 700 "$ACC/$name"
+    echo "Created '$name'. Run /login inside claude to sign in." >&2
+    launch "$name"
+    ;;
+  ls)
+    for a in $(accounts); do printf '%-16s %s\n' "$a" "$(email_of "$a")"; done
+    ;;
+  rm)
+    name="${2:-}"; [[ -n "$name" ]] || die "usage: cca rm <name>"
+    [[ "$(resolve "$name")" != default ]] || die "cannot remove the default account"
+    valid_name "$name"
+    [[ -d "$ACC/$name" ]] || die "no account '$name'"
+    read -r -p "Delete account '$name' and its login? [y/N] " ans
+    [[ "$ans" == [yY] ]] || { echo "aborted" >&2; exit 1; }
+    rm -rf -- "${ACC:?}/$name"
+    echo "removed '$name'" >&2
+    ;;
+  rename)
+    old="${2:-}" new="${3:-}"; [[ -n "$old" && -n "$new" ]] || die "usage: cca rename <old> <new>"
+    if [[ "$(resolve "$old")" == default ]]; then
+      mkdir -p -m 700 "$ACC"
+      if [[ "$new" == default ]]; then rm -f "$NAMEFILE"; exit 0; fi
+      valid_name "$new"; free_name "$new"
+      echo "$new" >"$NAMEFILE"; exit 0
+    fi
+    valid_name "$old"; valid_name "$new"
+    [[ -d "$ACC/$old" ]] || die "no account '$old'"
+    free_name "$new"
+    mv -- "$ACC/$old" "$ACC/$new"
+    ;;
+  help|-h|--help) awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0" ;;
+  *) launch "$@" ;;
+esac
